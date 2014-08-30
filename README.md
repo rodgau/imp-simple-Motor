@@ -19,7 +19,7 @@ Slightly more advanced code than the *imp-simple-PWM* project. Two potentiometer
 
 #### Other Features ####
 
-Potentiometer positioning knob centered moves motor to center position. Pot knob moved 25% off center; motor rotates in that direction until its pot is 25% off center too, etc...(IE. 1:1)
+Centering the potentiometer positioning knob centers the motor. Move the potentiometer 25% off center==>motor rotates in that direction until its pot is 25% off center too, etc...(IE. 1:1)
 
  * Controller's current state is held in a table refreshed in realtime.
  * Serial streamed output is comma-delimited list:
