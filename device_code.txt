@@ -1,0 +1,320 @@
+
+/** DC Motor Position Controller
+ * (proportional Feedback Loop)
+ * 
+ * DC motor position control via a simple Proportional feedback loop.
+ * Desired motor position read from potentiometer's input.
+ * A second POT is attached to motor shaft to provide error signal.
+ * Pot knob centered: motor moves to center.
+ * Pot knob turned to 25% either side: motor moves 25% either side. Etc... (i.e. 1:1)
+ * Multiple timer loops run concurrently:
+ *   -feedbackLoop() handles PID calcs (100 hz)
+ *   -dashboardOut() handles output logging stream (20 hz)
+ *   -heartbeat() 1 hz server.log in leui of LED flasher
+ *   -imp's Sampler() feature configured for all ADC potentiometer capture (100 hz).
+ * 10x oversampling on ADC inputs done as rudimentary noise filter (averaging).
+ * Controller's current state is held in a table refreshed in realtime.
+ * This table (motor[][]) contains: setpoint, motor position, error, duty cycle, etc.
+ * If Verbose logging is disabled this machine state can be graphed in real-time via an app such as DAQfactory.
+ * 
+ * Streamed output is comma-delimited list:
+ *   [setpoint, position, error, dutyCycle, setpoint_min, setpoint_max, position_min, position_max, direction]
+ * 
+ * H-Bridge is expected to be driven in direction + PWM mode (i.e. two seperate pins)
+ * 
+ * Revisions History:
+ *   Build:
+ *   004   -good working base to fork. Using DIR+PWM mode, and pot for setpoint (i.e. no serial motion data).
+ *
+ * TO DO List:
+ * -none
+ * 
+*/
+
+pwmFreq <- 5000; // PWM pulse frequency, Hz
+// proportional feedback gain (1/32768 gives 100% duty cycle when error is half the ADC range):
+Kp <- 1.0/32768.0; // adjust the numerator up or down to make a more agressive/or slower response (ex: 1.2, 1.6, 0.5, etc.)
+
+const PROC_FREQ = 100; // update frequency that POTs are polled and motor outputs are updated, Hz
+const DASH_FREQ = 20; // update frequency of dashboard serial output
+const OVERSAMPLING = 10; // no. of ADC readings to average per pin (channel)
+numMotors <- 1; // #of motors
+numAdcChannels <- 2 * numMotors; // total #of pins sampled each update (i.e. 1 setpoint & position pair per motor)
+serialVerbose <- false; // verbose logging/dashboard out serial port or straight data stream
+dashboardOn <- true; // stream dashboard data to serial
+
+
+// alias pin7 as motor1_output for PWM output at 5000 Hz pulse frequency
+motor1_output <- hardware.pin7;
+motor1_output.configure( PWM_OUT, 1.0/pwmFreq, 0.0 );
+
+// alias pin8 as digital output for motor1_direction
+motor1_direction <- hardware.pin8;
+motor1_direction.configure( DIGITAL_OUT );
+
+// alias pin5 analog input as POT setpoint
+motor1_setpoint <- hardware.pin5;
+motor1_setpoint.configure(ANALOG_IN);
+
+// alias pin2 analog input as motor1 POT position
+motor1_pot <- hardware.pin2;
+motor1_pot.configure(ANALOG_IN);
+
+// alias pin1,  UART12 as Tx
+serial <- hardware.uart12;
+
+/* main machine state array initialized here. Refreshed each update cycle.
+*  Contains each motor as [ setpoint, position, error, dutyCycle, setpoint_min, setpoint_max, position_min, position_max, direction ]
+*  i.e. 9 attributes as columnar index elements:
+*/
+motor <- array(numMotors)
+for (local i = 0 ; i < numMotors ; i++)
+{
+		motor[i] = array(9, 0)
+}
+// the above 2D array accessed as: motor[motorNumber][attribute_index]
+
+
+
+// imp ADC Sampler callback
+// each pin gets oversampled and then filter averaged here
+// updates motor[] global machine state
+function samplesReady(buffer, length)
+{
+	local val, valFiltered, tmp, max, min;
+	local i, j, m, channelNum, numSamples;
+	local str = "";
+
+	if (length > 0)
+	{
+		// for each pin, average its samples, find min/max:
+		for ( local m = 0; m < numMotors; ++m )
+		{
+			for ( j = 0; j < 2; ++j) // gets setpoint first, then position
+			{
+				tmp = 0;
+				val = 0;
+				max = 0;
+				min = 65535;
+				for ( i = 2*(m + j); i < length; i += (2 * numAdcChannels) )
+				{
+					val = buffer[i] + buffer[i+1] * 256; // shift little endian
+					if ( val > max )  max = val;
+					else if ( val < min) min = val;
+					tmp += val;
+				}
+				// calc average for our 'filtered' value
+				numSamples = (length / 2) / (numAdcChannels); // #samples = buffsize/2 / #channels
+				valFiltered = tmp / numSamples;
+				motor [m][j] = valFiltered;
+				motor [m][2*j+4] = min;
+				motor [m][2*j+5] = max;
+			}
+			
+			// serial.write( format( "%u %u %u %u %u %u %u %u %u\r\n",
+			//   motor[m][0],motor[m][1],motor[m][2],motor[m][3],motor[m][4],motor[m][5],motor[m][6],motor[m][7],motor[m][8]) );
+		}
+	}
+	else
+	{
+		server.log("buff Overrun");
+	}
+}
+
+
+/*
+// ADC Sampler config  (WORKING BACKUP COPY, non-array version)
+// each pin gets oversampled and filter averaged here
+// updates motor[] global
+function samplesReady(buffer, length)
+{
+	local val, valFiltered, tmp, max, min;
+	local i, channelNum, numSamples;
+	local str = "";
+
+	if (length > 0)
+	{
+		// for each data channel in sample stream, average samples and find min/max:
+		for ( channelNum = 0; channelNum < numAdcChannels; ++channelNum )
+		{
+			tmp = 0;
+			val = 0;
+			max = 0;
+			min = 65535;
+			
+			for ( i = 2 * channelNum; i < length; i += (2 * numAdcChannels) )
+			{
+				val = buffer[i] + buffer[i+1] * 256; // shift little endian
+				if ( val > max )  max = val;
+				else if ( val < min) min = val;
+				tmp += val;
+			}
+			// calc average for our 'filtered' value
+			numSamples = (length / 2) / (numAdcChannels); // #samples = buffsize/2 / #channels
+			valFiltered = tmp / numSamples;
+			if ( serialVerbose )
+				serial.write( format( "CHANNEL %d: Samples: %d. Value min/max/average: %u %u %u\r\n", channelNum, numSamples, min, max, valFiltered) );
+			else
+				str = str + format( "%d,%d,%u,%u,%u,", channelNum, numSamples, min, max, valFiltered);
+		}
+		str = str + "\r\n";
+		serial.write( str );
+	}
+	
+	else
+	{
+		server.log("buff Overrun");
+	}
+}
+
+*/
+
+/* -Sampler rules (general):
+			-Sampler can be used to generate an averaged samples output at a desired frequency
+			-consumes 2 bytes per sample (16 bits) into a buffer
+			-the two bytes are stored backwards, so true value = buffer1[i] + buffer1[i+1] * 256
+			-all pins sampled simultaneously, i.e. at each sample cycle
+			-when buffer fills, a callback function is called which can be used to analyze/average samples
+			-so callback freq = 2 * ( sampling freq ) / (buffsize)
+		Example: freq = 1000 hz, buffsize 2000, callback freq = 2 * (1000) / (2000) = 1 hz
+		
+		But, we want our callback freq = PROC_FREQ. Also, note that buffsize = #samples * 2, so
+			-Sampler sampling freq = #oversamples * PROC_FREQ
+			-set Sampler's sampling freq to this, with buffsize = 2 * #oversamples desired
+		Example: PROC_FREQ of 100 hz, OVERSAMPLING = 10,
+			-use a buffsize of 2*10 = 20, and a Sampler frequency of (100) hz.
+		
+		Pin considerations:
+			-sampling 1 pin:  use 2 buffers, each of size buffsize
+			-2 pins:          2 buffers, each of size (2 * buffsize)
+			-3 pins:          2 buffers, each of size (3 * buffsize)
+			 etc...
+			-data for pins is interleaved, i.e. pin1, pin2, pin1, pin2... in the buffer.
+			
+		Callback processing considerations:
+			-the CB function is blocking, meaning, it must finish before the next CB is called
+			-if it doesn't, the Sampler generates a buffer overrun condition
+			-this is communicated by passing a NULL buffer and a length value of 0 to the CB
+			-this state should be checked inside the CB.
+			-overruns can be avoided by
+*/
+
+// 3 buffers here required if verbose dashboard logging enabled (2 buffs gives a few overRuns )
+buffer1 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+buffer2 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+buffer3 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+// buffer4 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+// buffer5 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+// buffer6 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+// buffer7 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+// buffer8 <- blob( 2 * OVERSAMPLING * numAdcChannels);
+
+hardware.sampler.configure(  [motor1_setpoint, motor1_pot], (OVERSAMPLING * PROC_FREQ), [buffer1
+// hardware.sampler.configure(  [motor1_setpoint], (OVERSAMPLING * PROC_FREQ), [buffer1 
+
+,buffer2
+,buffer3 
+/*,buffer4
+,buffer5 
+,buffer6 
+,buffer7 
+,buffer8
+*/
+],
+samplesReady);
+
+
+// function to read setpoint, compare to motor position, and calc error and motor PWM output
+function feedbackLoop() 
+{
+	 // register this function to fire at PROC_FREQ frequency
+	imp.wakeup( 1.0/PROC_FREQ, feedbackLoop);
+
+	for( local m = 0; m < numMotors; ++m )
+	{
+		local setpoint = motor [m][0]; // get setpoint, 0-65535
+		local motorPot = motor [m][1]; // get motor position, 0-65535
+		local error = motorPot - setpoint;
+		local dutyCycle = Kp * error;
+		
+		// catch duty cycle clipping
+		if ( dutyCycle > 1.0 )
+			dutyCycle = 1.0;
+		else if ( dutyCycle < -1.0 )
+			dutyCycle = -1.0;
+			
+		// set direction
+		local dir;
+		if ( dutyCycle < 0.0 ) {
+			dir = 1;
+			dutyCycle = -dutyCycle;
+		}
+		else
+			dir = 0;
+	
+		motor1_direction.write(dir);
+		motor1_output.write( dutyCycle );
+	
+		// update machine state array with above calcs
+		// each motor has [ setpoint, position, error, dutyCycle, setpoint_min, setpoint_max, position_min, position_max, direction ]
+		motor [m][2] = error;
+		motor [m][3] = dutyCycle;
+		motor [m][8] = dir;
+ }
+}
+
+// function to send heartBeat to server
+function heartbeat()
+{
+	server.log( "bumbump");
+	 // register function to fire once every 3 secs
+	imp.wakeup( 3.0 , heartbeat );
+}
+
+// function to send dashboard data out serial port for monitoring and logging
+function dashboardOut()
+{
+	local str, m;
+	
+	if ( serialVerbose )
+	{
+		m = 0; // just motor #1 for now
+		str = format ( "SP: %u GP: %u ERROR: %i DutyCycle: %u Direction: %u SPmin: %u SPmax: %u GPmin: %u GPmax: %u\r\n",
+										motor[m][0], // setpoint (filtered)
+										motor[m][1], // pot reading (filtered)
+										motor[m][2], // error calc
+										(motor[m][3] * 100.0), // duty cycle %
+										motor[m][8], // motor direction
+										motor[m][4], // setpoint min in oversampled group
+										motor[m][5], // setpoint max in oversampled group
+										motor[m][6], // pot reading min in oversampled group
+										motor[m][7] ); // pot reading max in oversampled group
+	}
+	else
+	{
+		m = 0; // just motor #1 for now (coma-delimited with carriage return)
+		str = format ( "%u,%u,%i,%u,%u,%u,%u,%u,%u\r",
+										motor[m][0], // setpoint (filtered)
+										motor[m][1], // pot reading (filtered)
+										motor[m][2], // error calc
+										(motor[m][3] * 100.0), // duty cycle %
+										motor[m][8], // motor direction
+										motor[m][4], // setpoint min in oversampled group
+										motor[m][5], // setpoint max in oversampled group
+										motor[m][6], // pot reading min in oversampled group
+										motor[m][7] ); // pot reading max in oversampled group
+	}
+	serial.write( str );
+	 // register function to fire at set freq
+	imp.wakeup( 1.0/DASH_FREQ, dashboardOut );
+}
+
+
+// config serial port
+serial.configure(19200, 8, PARITY_NONE, 1, NO_CTSRTS|NO_RX);
+
+// start the loops
+heartbeat();
+hardware.sampler.start();
+feedbackLoop();
+if (dashboardOn) dashboardOut();
